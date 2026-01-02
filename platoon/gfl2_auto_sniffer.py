@@ -438,21 +438,25 @@ class GFL2ScoreSniffer:
     """Main sniffer class that captures and processes GFL2 traffic."""
     
     def __init__(self, output_file: str = 'gfl2_scores.csv', verbose: bool = False):
-        self.output_file = output_file
+        self.output_file = output_file  # Append log
+        self.current_state_file = output_file.replace('.csv', '_current.csv')
         self.global_output_file = output_file.replace('.csv', '_global_platoons.csv')
+        self.global_current_file = output_file.replace('.csv', '_global_platoons_current.csv')
         self.verbose = verbose
         self.reassembler = TCPStreamReassembler()
-        self.seen_records: Set[tuple] = set()  # Track seen records to avoid duplicates
-        self.seen_platoons: Set[tuple] = set()  # Track seen platoon records
         self.buffer = bytearray()
         self.last_process_time = datetime.now()
+        
+        # In-memory state for current scores (keyed by player/platoon name)
+        self.player_scores: Dict[str, Dict] = {}
+        self.platoon_scores: Dict[str, Dict] = {}
         
         # Check if protoc is available
         self.has_protoc = self._check_protoc()
         if not self.has_protoc:
             print("Note: protoc not found, using fallback decoder")
         
-        # Initialize CSV files with headers if they don't exist
+        # Initialize append log files with headers if they don't exist
         if not os.path.exists(output_file):
             with open(output_file, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
@@ -462,6 +466,42 @@ class GFL2ScoreSniffer:
             with open(self.global_output_file, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 writer.writerow(['timestamp', 'platoon_name', 'level', 'score'])
+        
+        # Load existing current state files if they exist
+        self._load_current_state()
+    
+    def _load_current_state(self):
+        """Load existing current state files if they exist."""
+        # Load player scores
+        if os.path.exists(self.current_state_file):
+            try:
+                with open(self.current_state_file, 'r', newline='', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        self.player_scores[row['name']] = {
+                            'name': row['name'],
+                            'platoon': row['platoon'],
+                            'high_score': int(row['high_score']),
+                            'total_score': int(row['total_score'])
+                        }
+                print(f"Loaded {len(self.player_scores)} existing player records from {self.current_state_file}")
+            except Exception as e:
+                print(f"Warning: Could not load {self.current_state_file}: {e}")
+        
+        # Load platoon scores
+        if os.path.exists(self.global_current_file):
+            try:
+                with open(self.global_current_file, 'r', newline='', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        self.platoon_scores[row['platoon_name']] = {
+                            'name': row['platoon_name'],
+                            'level': int(row['level']),
+                            'score': int(row['score'])
+                        }
+                print(f"Loaded {len(self.platoon_scores)} existing platoon records from {self.global_current_file}")
+            except Exception as e:
+                print(f"Warning: Could not load {self.global_current_file}: {e}")
     
     def _check_protoc(self) -> bool:
         """Check if protoc is available."""
@@ -513,58 +553,94 @@ class GFL2ScoreSniffer:
         records = extract_player_records(data, use_protoc=self.has_protoc)
         
         new_records = []
+        updated_records = []
         for record in records:
-            record_key = (record['name'], record['high_score'], record['total_score'])
-            if record_key not in self.seen_records:
-                self.seen_records.add(record_key)
+            name = record['name']
+            if name in self.player_scores:
+                # Check if score changed
+                old = self.player_scores[name]
+                if old['high_score'] != record['high_score'] or old['total_score'] != record['total_score']:
+                    updated_records.append(record)
+                    self.player_scores[name] = record
+            else:
                 new_records.append(record)
+                self.player_scores[name] = record
         
-        if new_records:
-            # Sort alphabetically by name
-            new_records.sort(key=lambda x: x['name'].lower())
-            self._save_records(new_records, timestamp)
-            print(f"\n[{timestamp}] Found {len(new_records)} new player records:")
-            for r in new_records[:10]:
-                print(f"  {r['name']:20s} {r['platoon']:20s} High:{r['high_score']:6d} Total:{r['total_score']:7d}")
-            if len(new_records) > 10:
-                print(f"  ... and {len(new_records) - 10} more")
+        # Append all incoming records to log (unsorted)
+        all_player_records = new_records + updated_records
+        if all_player_records:
+            self._append_to_log(all_player_records, timestamp)
+            self._save_current_player_state()
+            
+            print(f"\n[{timestamp}] Player scores: {len(new_records)} new, {len(updated_records)} updated")
+            for r in all_player_records[:10]:
+                status = "NEW" if r in new_records else "UPD"
+                print(f"  [{status}] {r['name']:20s} {r['platoon']:20s} High:{r['high_score']:6d} Total:{r['total_score']:7d}")
+            if len(all_player_records) > 10:
+                print(f"  ... and {len(all_player_records) - 10} more")
         
         # Try to extract global platoon records
         platoon_records = extract_global_platoon_records(data, use_protoc=self.has_protoc)
         
         new_platoons = []
+        updated_platoons = []
         for record in platoon_records:
-            record_key = (record['name'], record['score'])
-            if record_key not in self.seen_platoons:
-                self.seen_platoons.add(record_key)
+            name = record['name']
+            if name in self.platoon_scores:
+                old = self.platoon_scores[name]
+                if old['score'] != record['score'] or old['level'] != record['level']:
+                    updated_platoons.append(record)
+                    self.platoon_scores[name] = record
+            else:
                 new_platoons.append(record)
+                self.platoon_scores[name] = record
         
-        if new_platoons:
-            # Sort by score descending
-            new_platoons.sort(key=lambda x: x['score'], reverse=True)
-            self._save_global_platoons(new_platoons, timestamp)
-            print(f"\n[{timestamp}] Found {len(new_platoons)} global platoon rankings:")
-            for r in new_platoons[:10]:
-                print(f"  {r['name']:30s} Level:{r['level']:3d} Score:{r['score']:10d}")
-            if len(new_platoons) > 10:
-                print(f"  ... and {len(new_platoons) - 10} more")
+        all_platoon_records = new_platoons + updated_platoons
+        if all_platoon_records:
+            self._append_global_to_log(all_platoon_records, timestamp)
+            self._save_current_platoon_state()
+            
+            print(f"\n[{timestamp}] Global platoons: {len(new_platoons)} new, {len(updated_platoons)} updated")
+            for r in sorted(all_platoon_records, key=lambda x: x['score'], reverse=True)[:10]:
+                status = "NEW" if r in new_platoons else "UPD"
+                print(f"  [{status}] {r['name']:30s} Level:{r['level']:3d} Score:{r['score']:10d}")
+            if len(all_platoon_records) > 10:
+                print(f"  ... and {len(all_platoon_records) - 10} more")
         
         # Clear buffer after processing
         self.buffer.clear()
     
-    def _save_records(self, records: List[Dict], timestamp: str):
-        """Append records to CSV file."""
+    def _append_to_log(self, records: List[Dict], timestamp: str):
+        """Append records to the log CSV file (unsorted)."""
         with open(self.output_file, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             for r in records:
                 writer.writerow([timestamp, r['name'], r['platoon'], r['high_score'], r['total_score']])
     
-    def _save_global_platoons(self, records: List[Dict], timestamp: str):
-        """Append global platoon records to CSV file."""
+    def _append_global_to_log(self, records: List[Dict], timestamp: str):
+        """Append global platoon records to the log CSV file."""
         with open(self.global_output_file, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             for r in records:
                 writer.writerow([timestamp, r['name'], r['level'], r['score']])
+    
+    def _save_current_player_state(self):
+        """Save current player state to file (sorted alphabetically)."""
+        sorted_players = sorted(self.player_scores.values(), key=lambda x: x['name'].lower())
+        with open(self.current_state_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['name', 'platoon', 'high_score', 'total_score'])
+            for r in sorted_players:
+                writer.writerow([r['name'], r['platoon'], r['high_score'], r['total_score']])
+    
+    def _save_current_platoon_state(self):
+        """Save current platoon state to file (sorted by score descending)."""
+        sorted_platoons = sorted(self.platoon_scores.values(), key=lambda x: x['score'], reverse=True)
+        with open(self.global_current_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['platoon_name', 'level', 'score'])
+            for r in sorted_platoons:
+                writer.writerow([r['name'], r['level'], r['score']])
     
     def start(self, interface: Optional[str] = None):
         """Start sniffing for GFL2 traffic."""
@@ -574,8 +650,11 @@ class GFL2ScoreSniffer:
         print("=" * 60)
         print("GFL2 Platoon Score Auto-Sniffer")
         print("=" * 60)
-        print(f"Player scores output: {self.output_file}")
-        print(f"Global platoon output: {self.global_output_file}")
+        print("Output files:")
+        print(f"  Player log (append):    {self.output_file}")
+        print(f"  Player current (A-Z):   {self.current_state_file}")
+        print(f"  Platoon log (append):   {self.global_output_file}")
+        print(f"  Platoon current (rank): {self.global_current_file}")
         print(f"Listening for GFL2 traffic on port {GFL2_PORT}")
         print(f"Interface: {interface or 'auto'}")
         print("-" * 60)
