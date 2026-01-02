@@ -294,14 +294,156 @@ def extract_platoon_from_record(data: bytes) -> Optional[str]:
     return None
 
 
+def extract_global_platoon_records(data: bytes, use_protoc: bool = True) -> List[Dict]:
+    """
+    Extract global platoon ranking records from binary data.
+    These have a different structure than individual player records.
+    
+    Structure:
+    - Field 1: Platoon ID
+    - Field 2: Platoon name
+    - Field 3: Level
+    - Field 6: Total score
+    """
+    records = {}
+    i = 0
+    
+    while i < len(data) - 10:
+        if data[i] == 0x0a:  # Field 1, length-delimited
+            try:
+                length, content_start = decode_varint(data, i + 1)
+                
+                # Global platoon records are typically 100-500 bytes
+                if 100 <= length <= 500 and content_start < len(data):
+                    record_end = content_start + length
+                    
+                    if record_end <= len(data):
+                        record_data = data[content_start:record_end]
+                        
+                        # Check if starts with field 1 (platoon ID)
+                        if len(record_data) > 10 and record_data[0] == 0x08:
+                            record = decode_global_platoon_record(record_data, use_protoc)
+                            
+                            if record and record.get('name'):
+                                key = record['name']
+                                # Keep the one with highest score if duplicates
+                                if key not in records or record['score'] > records[key]['score']:
+                                    records[key] = record
+            except:
+                pass
+        i += 1
+    
+    return list(records.values())
+
+
+def decode_global_platoon_record(record_data: bytes, use_protoc: bool = True) -> Optional[Dict]:
+    """Decode a global platoon ranking record."""
+    if use_protoc:
+        record = decode_global_platoon_with_protoc(record_data)
+        if record:
+            return record
+    
+    # Fallback to manual parsing
+    return decode_global_platoon_fallback(record_data)
+
+
+def decode_global_platoon_with_protoc(record_data: bytes) -> Optional[Dict]:
+    """Decode global platoon record using protoc."""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.bin') as f:
+            f.write(record_data)
+            tmpfile = f.name
+        
+        result = subprocess.run(
+            ['protoc', '--decode_raw'],
+            stdin=open(tmpfile, 'rb'),
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        
+        os.unlink(tmpfile)
+        
+        if result.returncode != 0:
+            return None
+        
+        decoded = result.stdout
+        
+        # Extract fields
+        name_match = re.search(r'^2: "([^"]+)"', decoded, re.MULTILINE)
+        score_match = re.search(r'^6: (\d+)', decoded, re.MULTILINE)
+        level_match = re.search(r'^3: (\d+)', decoded, re.MULTILINE)
+        
+        if not (name_match and score_match):
+            return None
+        
+        score = int(score_match.group(1))
+        
+        # Filter out non-platoon records (individual player data has scores < 10000)
+        if score < 100000:
+            return None
+        
+        return {
+            'name': name_match.group(1),
+            'level': int(level_match.group(1)) if level_match else 0,
+            'score': score
+        }
+    except FileNotFoundError:
+        return None
+    except:
+        return None
+
+
+def decode_global_platoon_fallback(record_data: bytes) -> Optional[Dict]:
+    """Fallback decoder for global platoon records."""
+    try:
+        # Look for field 6 (tag 0x30) which contains the score
+        for i in range(len(record_data) - 6):
+            if record_data[i] == 0x30:  # Field 6 tag
+                score, _ = decode_varint(record_data, i + 1)
+                
+                # Global platoon scores are typically > 100,000
+                if score >= 100000:
+                    # Find platoon name (field 2, tag 0x12)
+                    name = None
+                    for j in range(i):
+                        if record_data[j] == 0x12:
+                            name_len = record_data[j + 1]
+                            if 2 <= name_len <= 30:
+                                try:
+                                    name = record_data[j + 2:j + 2 + name_len].decode('utf-8')
+                                    break
+                                except:
+                                    pass
+                    
+                    # Find level (field 3, tag 0x18)
+                    level = 0
+                    for j in range(i):
+                        if record_data[j] == 0x18:
+                            level, _ = decode_varint(record_data, j + 1)
+                            break
+                    
+                    if name:
+                        return {
+                            'name': name,
+                            'level': level,
+                            'score': score
+                        }
+        return None
+    except:
+        return None
+
+
 class GFL2ScoreSniffer:
     """Main sniffer class that captures and processes GFL2 traffic."""
     
     def __init__(self, output_file: str = 'gfl2_scores.csv', verbose: bool = False):
         self.output_file = output_file
+        self.global_output_file = output_file.replace('.csv', '_global_platoons.csv')
         self.verbose = verbose
         self.reassembler = TCPStreamReassembler()
         self.seen_records: Set[tuple] = set()  # Track seen records to avoid duplicates
+        self.seen_platoons: Set[tuple] = set()  # Track seen platoon records
         self.buffer = bytearray()
         self.last_process_time = datetime.now()
         
@@ -310,11 +452,16 @@ class GFL2ScoreSniffer:
         if not self.has_protoc:
             print("Note: protoc not found, using fallback decoder")
         
-        # Initialize CSV file with headers if it doesn't exist
+        # Initialize CSV files with headers if they don't exist
         if not os.path.exists(output_file):
             with open(output_file, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 writer.writerow(['timestamp', 'name', 'platoon', 'high_score', 'total_score'])
+        
+        if not os.path.exists(self.global_output_file):
+            with open(self.global_output_file, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['timestamp', 'platoon_name', 'level', 'score'])
     
     def _check_protoc(self) -> bool:
         """Check if protoc is available."""
@@ -355,20 +502,19 @@ class GFL2ScoreSniffer:
             self._process_buffer()
     
     def _process_buffer(self):
-        """Process accumulated buffer for player records."""
+        """Process accumulated buffer for player records and global platoon records."""
         if len(self.buffer) < 500:
             return
         
         data = bytes(self.buffer)
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Try to extract individual player records
         records = extract_player_records(data, use_protoc=self.has_protoc)
         
         new_records = []
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
         for record in records:
-            # Create a unique key for this record
             record_key = (record['name'], record['high_score'], record['total_score'])
-            
             if record_key not in self.seen_records:
                 self.seen_records.add(record_key)
                 new_records.append(record)
@@ -383,6 +529,26 @@ class GFL2ScoreSniffer:
             if len(new_records) > 10:
                 print(f"  ... and {len(new_records) - 10} more")
         
+        # Try to extract global platoon records
+        platoon_records = extract_global_platoon_records(data, use_protoc=self.has_protoc)
+        
+        new_platoons = []
+        for record in platoon_records:
+            record_key = (record['name'], record['score'])
+            if record_key not in self.seen_platoons:
+                self.seen_platoons.add(record_key)
+                new_platoons.append(record)
+        
+        if new_platoons:
+            # Sort by score descending
+            new_platoons.sort(key=lambda x: x['score'], reverse=True)
+            self._save_global_platoons(new_platoons, timestamp)
+            print(f"\n[{timestamp}] Found {len(new_platoons)} global platoon rankings:")
+            for r in new_platoons[:10]:
+                print(f"  {r['name']:30s} Level:{r['level']:3d} Score:{r['score']:10d}")
+            if len(new_platoons) > 10:
+                print(f"  ... and {len(new_platoons) - 10} more")
+        
         # Clear buffer after processing
         self.buffer.clear()
     
@@ -393,6 +559,13 @@ class GFL2ScoreSniffer:
             for r in records:
                 writer.writerow([timestamp, r['name'], r['platoon'], r['high_score'], r['total_score']])
     
+    def _save_global_platoons(self, records: List[Dict], timestamp: str):
+        """Append global platoon records to CSV file."""
+        with open(self.global_output_file, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            for r in records:
+                writer.writerow([timestamp, r['name'], r['level'], r['score']])
+    
     def start(self, interface: Optional[str] = None):
         """Start sniffing for GFL2 traffic."""
         # Build filter for GFL2 traffic
@@ -401,15 +574,17 @@ class GFL2ScoreSniffer:
         print("=" * 60)
         print("GFL2 Platoon Score Auto-Sniffer")
         print("=" * 60)
-        print(f"Output file: {self.output_file}")
+        print(f"Player scores output: {self.output_file}")
+        print(f"Global platoon output: {self.global_output_file}")
         print(f"Listening for GFL2 traffic on port {GFL2_PORT}")
         print(f"Interface: {interface or 'auto'}")
         print("-" * 60)
         print("Instructions:")
         print("  1. Start Girls' Frontline 2")
         print("  2. Open the Platoon menu and view scores")
-        print("  3. Scores will be automatically captured and saved")
-        print("  4. Press Ctrl+C to stop")
+        print("  3. For global rankings, view the platoon leaderboard")
+        print("  4. Scores will be automatically captured and saved")
+        print("  5. Press Ctrl+C to stop")
         print("-" * 60)
         print("Waiting for GFL2 traffic...\n")
         
