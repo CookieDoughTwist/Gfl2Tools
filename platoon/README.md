@@ -3,6 +3,10 @@
 Automatically captures platoon scores from Girls' Frontline 2 while you play.
 Just run the sniffer, open the platoon menu in-game, and scores are saved to CSV files.
 
+## TLDR
+
+Run the `start_gfl2_sniffer.bat` -> Allow everything -> Fix errors if you have them (install details below)
+
 ## Features
 
 - **Individual Player Scores**: Captures each player's high score and total score within your platoon
