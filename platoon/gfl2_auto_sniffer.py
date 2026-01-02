@@ -40,7 +40,7 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Set
 
 try:
-    from scapy.all import sniff, TCP, IP, Raw, get_if_list, get_if_addrs, conf
+    from scapy.all import sniff, TCP, IP, Raw, get_if_list, conf
 except ImportError:
     print("Error: scapy is not installed. Run: pip install scapy")
     sys.exit(1)
@@ -374,9 +374,11 @@ class GFL2ScoreSniffer:
                 new_records.append(record)
         
         if new_records:
+            # Sort alphabetically by name
+            new_records.sort(key=lambda x: x['name'].lower())
             self._save_records(new_records, timestamp)
             print(f"\n[{timestamp}] Found {len(new_records)} new player records:")
-            for r in sorted(new_records, key=lambda x: x['total_score'], reverse=True)[:10]:
+            for r in new_records[:10]:
                 print(f"  {r['name']:20s} {r['platoon']:20s} High:{r['high_score']:6d} Total:{r['total_score']:7d}")
             if len(new_records) > 10:
                 print(f"  ... and {len(new_records) - 10} more")
@@ -431,16 +433,8 @@ def list_interfaces():
     print("Available network interfaces:")
     print("-" * 40)
     
-    try:
-        addrs = get_if_addrs()
-        for iface in get_if_list():
-            addr_info = addrs.get(iface, {})
-            ip = addr_info.get('addr', 'N/A') if isinstance(addr_info, dict) else 'N/A'
-            print(f"  {iface}: {ip}")
-    except Exception as e:
-        # Fallback for Windows
-        for iface in get_if_list():
-            print(f"  {iface}")
+    for iface in get_if_list():
+        print(f"  {iface}")
     
     print("-" * 40)
     print("Use -i <interface> to specify which one to use")
