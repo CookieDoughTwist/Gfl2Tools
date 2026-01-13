@@ -170,7 +170,9 @@ def extract_player_records(data: bytes, use_protoc: bool = True) -> List[Dict]:
             try:
                 length, content_start = decode_varint(data, i + 1)
                 
-                if 200 <= length <= 600 and content_start < len(data):
+                # Records can be 140-600 bytes - the outer wrapper with scores
+                # is typically 140-200 bytes, but can be larger with more player data
+                if 140 <= length <= 600 and content_start < len(data):
                     if data[content_start] == 0x0a:  # Nested message
                         record_end = content_start + length
                         
@@ -215,19 +217,34 @@ def decode_with_protoc(record_data: bytes) -> Optional[Dict]:
         
         decoded = result.stdout
         
+        # Extract player name (first occurrence of field 2 with a string)
         name_match = re.search(r'2: "([^"]+)"', decoded)
+        # Extract platoon (field 13)
         platoon_match = re.search(r'13: "([^"]+)"', decoded)
-        high_score_match = re.search(r'^5: (\d+)', decoded, re.MULTILINE)
-        total_score_match = re.search(r'^6: (\d+)', decoded, re.MULTILINE)
         
-        if not (name_match and high_score_match and total_score_match):
+        # IMPORTANT: The scores are at the OUTER wrapper level, not nested.
+        # In protoc output, outer fields have no leading whitespace.
+        # We need the LAST occurrence of "^5:" and "^6:" (at line start, no indent)
+        # to get the outer wrapper scores, not the inner nested ones.
+        high_score_matches = re.findall(r'^5: (\d+)', decoded, re.MULTILINE)
+        total_score_matches = re.findall(r'^6: (\d+)', decoded, re.MULTILINE)
+        
+        if not (name_match and high_score_matches and total_score_matches):
+            return None
+        
+        # Use the LAST match which is the outer wrapper score
+        high_score = int(high_score_matches[-1])
+        total_score = int(total_score_matches[-1])
+        
+        # Sanity check: scores should be reasonable values
+        if high_score < 100 or total_score < 100:
             return None
         
         return {
             'name': name_match.group(1),
             'platoon': platoon_match.group(1) if platoon_match else 'Unknown',
-            'high_score': int(high_score_match.group(1)),
-            'total_score': int(total_score_match.group(1))
+            'high_score': high_score,
+            'total_score': total_score
         }
     except FileNotFoundError:
         return None  # protoc not installed
@@ -238,24 +255,34 @@ def decode_with_protoc(record_data: bytes) -> Optional[Dict]:
 def decode_player_record_fallback(record_data: bytes) -> Optional[Dict]:
     """Fallback decoder when protoc is not available."""
     try:
+        # The scores are at the OUTER wrapper level, which appears AFTER the nested
+        # player data. Search from the END of the record to find the outer scores first.
         # Look for score pattern: 0x28 (field 5) followed by varint, then 0x30 (field 6)
+        
+        # Search backwards to find the LAST occurrence of field 5/6 pattern
+        best_match = None
         for i in range(len(record_data) - 10):
             if record_data[i] == 0x28:  # Field 5 tag
                 high_score, pos = decode_varint(record_data, i + 1)
-                if 1000 <= high_score <= 50000 and pos < len(record_data) and record_data[pos] == 0x30:
+                if 100 <= high_score <= 100000 and pos < len(record_data) and record_data[pos] == 0x30:
                     total_score, pos2 = decode_varint(record_data, pos + 1)
-                    if 10000 <= total_score <= 500000:
-                        # Found scores, now find name (field 2 in nested message)
-                        name = extract_name_from_record(record_data)
-                        platoon = extract_platoon_from_record(record_data)
-                        
-                        if name:
-                            return {
-                                'name': name,
-                                'platoon': platoon or 'Unknown',
-                                'high_score': high_score,
-                                'total_score': total_score
-                            }
+                    if 100 <= total_score <= 1000000:
+                        # Keep track of this match - later matches (closer to end) are better
+                        best_match = (high_score, total_score)
+        
+        if best_match:
+            high_score, total_score = best_match
+            # Found scores, now find name (field 2 in nested message)
+            name = extract_name_from_record(record_data)
+            platoon = extract_platoon_from_record(record_data)
+            
+            if name:
+                return {
+                    'name': name,
+                    'platoon': platoon or 'Unknown',
+                    'high_score': high_score,
+                    'total_score': total_score
+                }
         return None
     except:
         return None
@@ -267,12 +294,18 @@ def extract_name_from_record(data: bytes) -> Optional[str]:
     for i in range(len(data) - 5):
         if data[i] == 0x12:
             length = data[i + 1]
-            if 2 <= length <= 25 and i + 2 + length <= len(data):
+            # Allow single-character names (length >= 1)
+            # Allow up to 50 bytes to accommodate multi-byte Unicode (e.g. Thai, Chinese, Japanese)
+            # A 25-character name in Thai could be 75 bytes
+            if 1 <= length <= 50 and i + 2 + length <= len(data):
                 try:
                     name = data[i + 2:i + 2 + length].decode('utf-8')
-                    # Filter out non-name strings
-                    if name.isprintable() and not any(x in name.lower() for x in ['<color', '<size', 'http', '.com']):
-                        return name
+                    # Filter out non-name strings (HTML tags, URLs)
+                    # Don't use isprintable() as it fails on valid Unicode like Thai
+                    if not any(x in name.lower() for x in ['<color', '<size', 'http', '.com', '\x00']):
+                        # Basic sanity check - should have at least one letter/digit
+                        if any(c.isalnum() for c in name):
+                            return name
                 except:
                     pass
     return None
@@ -304,6 +337,8 @@ def extract_global_platoon_records(data: bytes, use_protoc: bool = True) -> List
     - Field 2: Platoon name
     - Field 3: Level
     - Field 6: Total score
+    - Field 8.1.1: MVP player ID
+    - Field 8.1.2: MVP player name
     """
     records = {}
     i = 0
@@ -324,8 +359,8 @@ def extract_global_platoon_records(data: bytes, use_protoc: bool = True) -> List
                         if len(record_data) > 10 and record_data[0] == 0x08:
                             record = decode_global_platoon_record(record_data, use_protoc)
                             
-                            if record and record.get('name'):
-                                key = record['name']
+                            if record and record.get('platoon_id'):
+                                key = record['platoon_id']
                                 # Keep the one with highest score if duplicates
                                 if key not in records or record['score'] > records[key]['score']:
                                     records[key] = record
@@ -369,24 +404,32 @@ def decode_global_platoon_with_protoc(record_data: bytes) -> Optional[Dict]:
         
         decoded = result.stdout
         
-        # Extract fields
+        # Extract platoon fields
+        platoon_id_match = re.search(r'^1: (\d+)', decoded, re.MULTILINE)
         name_match = re.search(r'^2: "([^"]+)"', decoded, re.MULTILINE)
         score_match = re.search(r'^6: (\d+)', decoded, re.MULTILINE)
         level_match = re.search(r'^3: (\d+)', decoded, re.MULTILINE)
         
-        if not (name_match and score_match):
+        # Extract MVP info from field 8.1
+        mvp_id_match = re.search(r'8 \{\s+1 \{\s+1: (\d+)', decoded)
+        mvp_name_match = re.search(r'8 \{\s+1 \{\s+1: \d+\s+2: "([^"]+)"', decoded)
+        
+        if not (platoon_id_match and name_match and score_match):
             return None
         
         score = int(score_match.group(1))
         
-        # Filter out non-platoon records (individual player data has scores < 10000)
+        # Filter out non-platoon records (individual player data has scores < 100000)
         if score < 100000:
             return None
         
         return {
+            'platoon_id': int(platoon_id_match.group(1)),
             'name': name_match.group(1),
             'level': int(level_match.group(1)) if level_match else 0,
-            'score': score
+            'score': score,
+            'mvp_id': int(mvp_id_match.group(1)) if mvp_id_match else 0,
+            'mvp_name': mvp_name_match.group(1) if mvp_name_match else ''
         }
     except FileNotFoundError:
         return None
@@ -397,6 +440,11 @@ def decode_global_platoon_with_protoc(record_data: bytes) -> Optional[Dict]:
 def decode_global_platoon_fallback(record_data: bytes) -> Optional[Dict]:
     """Fallback decoder for global platoon records."""
     try:
+        # First get platoon ID (field 1, tag 0x08)
+        platoon_id = None
+        if record_data[0] == 0x08:
+            platoon_id, next_pos = decode_varint(record_data, 1)
+        
         # Look for field 6 (tag 0x30) which contains the score
         for i in range(len(record_data) - 6):
             if record_data[i] == 0x30:  # Field 6 tag
@@ -423,11 +471,14 @@ def decode_global_platoon_fallback(record_data: bytes) -> Optional[Dict]:
                             level, _ = decode_varint(record_data, j + 1)
                             break
                     
-                    if name:
+                    if name and platoon_id:
                         return {
+                            'platoon_id': platoon_id,
                             'name': name,
                             'level': level,
-                            'score': score
+                            'score': score,
+                            'mvp_id': 0,  # Fallback can't easily extract nested MVP
+                            'mvp_name': ''
                         }
         return None
     except:
@@ -465,7 +516,7 @@ class GFL2ScoreSniffer:
         if not os.path.exists(self.global_output_file):
             with open(self.global_output_file, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow(['timestamp', 'platoon_name', 'level', 'score'])
+                writer.writerow(['timestamp', 'platoon_id', 'platoon_name', 'level', 'score', 'mvp_id', 'mvp_name'])
         
         # Load existing current state files if they exist
         self._load_current_state()
@@ -494,10 +545,14 @@ class GFL2ScoreSniffer:
                 with open(self.global_current_file, 'r', newline='', encoding='utf-8') as f:
                     reader = csv.DictReader(f)
                     for row in reader:
-                        self.platoon_scores[row['platoon_name']] = {
+                        platoon_id = int(row['platoon_id'])
+                        self.platoon_scores[platoon_id] = {
+                            'platoon_id': platoon_id,
                             'name': row['platoon_name'],
                             'level': int(row['level']),
-                            'score': int(row['score'])
+                            'score': int(row['score']),
+                            'mvp_id': int(row['mvp_id']) if row.get('mvp_id') else 0,
+                            'mvp_name': row.get('mvp_name', '')
                         }
                 print(f"Loaded {len(self.platoon_scores)} existing platoon records from {self.global_current_file}")
             except Exception as e:
@@ -585,15 +640,16 @@ class GFL2ScoreSniffer:
         new_platoons = []
         updated_platoons = []
         for record in platoon_records:
-            name = record['name']
-            if name in self.platoon_scores:
-                old = self.platoon_scores[name]
-                if old['score'] != record['score'] or old['level'] != record['level']:
+            platoon_id = record['platoon_id']
+            if platoon_id in self.platoon_scores:
+                old = self.platoon_scores[platoon_id]
+                if (old['score'] != record['score'] or old['level'] != record['level'] 
+                    or old['name'] != record['name'] or old['mvp_id'] != record['mvp_id']):
                     updated_platoons.append(record)
-                    self.platoon_scores[name] = record
+                    self.platoon_scores[platoon_id] = record
             else:
                 new_platoons.append(record)
-                self.platoon_scores[name] = record
+                self.platoon_scores[platoon_id] = record
         
         all_platoon_records = new_platoons + updated_platoons
         if all_platoon_records:
@@ -603,7 +659,7 @@ class GFL2ScoreSniffer:
             print(f"\n[{timestamp}] Global platoons: {len(new_platoons)} new, {len(updated_platoons)} updated")
             for r in sorted(all_platoon_records, key=lambda x: x['score'], reverse=True)[:10]:
                 status = "NEW" if r in new_platoons else "UPD"
-                print(f"  [{status}] {r['name']:30s} Level:{r['level']:3d} Score:{r['score']:10d}")
+                print(f"  [{status}] {r['platoon_id']:6d} {r['name']:30s} Lv:{r['level']:2d} Score:{r['score']:10d} MVP:{r['mvp_name']}")
             if len(all_platoon_records) > 10:
                 print(f"  ... and {len(all_platoon_records) - 10} more")
         
@@ -622,7 +678,7 @@ class GFL2ScoreSniffer:
         with open(self.global_output_file, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             for r in records:
-                writer.writerow([timestamp, r['name'], r['level'], r['score']])
+                writer.writerow([timestamp, r['platoon_id'], r['name'], r['level'], r['score'], r['mvp_id'], r['mvp_name']])
     
     def _save_current_player_state(self):
         """Save current player state to file (sorted alphabetically)."""
@@ -638,9 +694,9 @@ class GFL2ScoreSniffer:
         sorted_platoons = sorted(self.platoon_scores.values(), key=lambda x: x['score'], reverse=True)
         with open(self.global_current_file, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(['platoon_name', 'level', 'score'])
+            writer.writerow(['platoon_id', 'platoon_name', 'level', 'score', 'mvp_id', 'mvp_name'])
             for r in sorted_platoons:
-                writer.writerow([r['name'], r['level'], r['score']])
+                writer.writerow([r['platoon_id'], r['name'], r['level'], r['score'], r['mvp_id'], r['mvp_name']])
     
     def start(self, interface: Optional[str] = None):
         """Start sniffing for GFL2 traffic."""
